@@ -85,6 +85,19 @@ def sign_video_path(hass: Any, path: str) -> str:
     return path
 
 
+def upstream_urls(url: str) -> list[str]:
+    """Upstream URLs to try for a clip, in order.
+
+    Google Photos videos point at Google's 720p H.264 stream (``=m22``), which
+    plays everywhere and honours ``Range``. Short or still-processing clips may
+    not have it yet, so fall back to the 360p stream, then the original file.
+    """
+    if url.endswith("=m22"):
+        base = url[: -len("=m22")]
+        return [url, f"{base}=m18", f"{base}=dv"]
+    return [url]
+
+
 def find_video_item(coordinator: Any, photo_id: str) -> Any | None:
     """Return the playlist's video item with ``photo_id``, if any."""
     data = getattr(coordinator, "data", None) or {}
@@ -127,17 +140,22 @@ class AlbumSlideshowVideoView(HomeAssistantView):
             self.hass,
             verify_ssl=getattr(coordinator, "image_request_verify_ssl", True),
         )
-        try:
-            upstream = await session.get(
-                item.video_url,
-                headers=upstream_request_headers(coordinator, request.headers),
-                params=getattr(coordinator, "image_request_params", None) or None,
-                # No total timeout: a long clip can legitimately stream for minutes.
-                timeout=ClientTimeout(total=None, sock_connect=15, sock_read=60),
-            )
-        except (ClientError, TimeoutError) as err:
-            _LOGGER.debug("Album Slideshow: video upstream failed for %s: %s", photo_id, err)
-            return web.Response(status=502)
+        candidates = upstream_urls(item.video_url)
+        for n, url in enumerate(candidates, 1):
+            try:
+                upstream = await session.get(
+                    url,
+                    headers=upstream_request_headers(coordinator, request.headers),
+                    params=getattr(coordinator, "image_request_params", None) or None,
+                    # No total timeout: a long clip can legitimately stream for minutes.
+                    timeout=ClientTimeout(total=None, sock_connect=15, sock_read=60),
+                )
+            except (ClientError, TimeoutError) as err:
+                _LOGGER.debug("Album Slideshow: video upstream failed for %s: %s", photo_id, err)
+                return web.Response(status=502)
+            if upstream.status != 404 or n == len(candidates):
+                break
+            upstream.release()
 
         async with upstream:
             if upstream.status == 416:

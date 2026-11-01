@@ -239,7 +239,7 @@ def test_batchexecute_handles_garbage():
     assert next_id is None
 
 
-def test_batchexecute_filters_videos():
+def test_batchexecute_keeps_videos_as_playable_items():
     # A video has a duration dict (key 76647426) as its last element.
     photo = ["mk1", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
     video = [
@@ -253,11 +253,16 @@ def test_batchexecute_filters_videos():
     ]
     body = _make_batchexecute_response([photo, video], None)
     items, _ = gs._parse_batchexecute_album_page(body)
-    assert len(items) == 1
+    assert len(items) == 2
     assert items[0].url.startswith("https://lh3.googleusercontent.com/p=")
+    assert not items[0].is_video
+    assert items[1].url.startswith("https://lh3.googleusercontent.com/v=w")
+    assert items[1].video_url == "https://lh3.googleusercontent.com/v=m22"
+    assert items[1].duration_ms == 12345
+    assert items[1].is_video
 
 
-def test_batchexecute_filters_videos_when_duration_is_not_last():
+def test_batchexecute_finds_videos_when_duration_is_not_last():
     # The duration dict does not always sit at the end of the item (see #26).
     photo = ["mk1", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
     video = [
@@ -271,11 +276,11 @@ def test_batchexecute_filters_videos_when_duration_is_not_last():
     ]
     body = _make_batchexecute_response([photo, video], None)
     items, _ = gs._parse_batchexecute_album_page(body)
-    assert len(items) == 1
-    assert items[0].url.startswith("https://lh3.googleusercontent.com/p=")
+    assert [it.is_video for it in items] == [False, True]
+    assert items[1].duration_ms == 12345
 
 
-def test_batchexecute_filters_videos_with_nested_duration():
+def test_batchexecute_finds_videos_with_nested_duration():
     photo = ["mk1", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
     video = [
         "mk2",
@@ -286,7 +291,43 @@ def test_batchexecute_filters_videos_with_nested_duration():
     ]
     body = _make_batchexecute_response([photo, video], None)
     items, _ = gs._parse_batchexecute_album_page(body)
+    assert [it.is_video for it in items] == [False, True]
+    assert items[1].duration_ms == 9000
+
+
+def test_batchexecute_still_skips_live_photos():
+    photo = ["mk1", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
+    live = [
+        "mk2",
+        ["https://lh3.googleusercontent.com/l", 100, 100],
+        0,
+        "d2",
+        {"76647426": [3000], "146008172": [1]},
+    ]
+    keys: set[str] = set()
+    items, _ = gs._parse_batchexecute_album_page(
+        _make_batchexecute_response([photo, live], None), keys
+    )
     assert len(items) == 1
+    assert not items[0].is_video
+    assert keys == {"mk2"}
+
+
+def test_video_url_drops_the_size_suffix():
+    video = [
+        "mk", ["https://lh3.googleusercontent.com/v=w640-h480", 640, 480], 0, "d",
+        {"76647426": ["not a number"]},
+    ]
+    items, _ = gs._parse_batchexecute_album_page(_make_batchexecute_response([video], None))
+    assert items[0].video_url == "https://lh3.googleusercontent.com/v=m22"
+    assert items[0].duration_ms is None
+
+
+def test_html_first_page_keeps_videos():
+    photo = ["mk1", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
+    video = ["mk2", ["https://lh3.googleusercontent.com/v", 100, 100], 0, "d2", {"76647426": [5000]}]
+    items = gs.parse_album_html(_make_html([photo, video]))
+    assert [it.is_video for it in items] == [False, True]
 
 
 def test_batchexecute_accepts_integer_duration_key():
@@ -408,7 +449,7 @@ def test_parse_album_item_handles_missing_size():
 # publicalbum.org returns mimetype/mediaMetadata as null, so it cannot spot a
 # video on its own. It reuses the keys the scraper collected here.
 
-def test_batchexecute_records_media_keys_of_skipped_videos():
+def test_batchexecute_records_media_keys_of_videos():
     photo = ["mk_photo", ["https://lh3.googleusercontent.com/p", 100, 100], 0, "d1"]
     video = [
         "mk_video",
@@ -424,7 +465,7 @@ def test_batchexecute_records_media_keys_of_skipped_videos():
     keys: set[str] = set()
     items, _ = gs._parse_batchexecute_album_page(body, keys)
 
-    assert len(items) == 1
+    assert len(items) == 2
     assert keys == {"mk_video"}
 
 

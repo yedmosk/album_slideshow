@@ -60,7 +60,7 @@ _PAGE_SIZE = 300
 # attach our own size hint based on the photo's known dimensions.
 _SIZE_SUFFIX_RE = re.compile(r"=[wh]\d+(?:-[a-z0-9]+)*$", re.IGNORECASE)
 
-_VIDEO_DURATION_KEY = 76647426  # presence indicates a video; we skip those
+_VIDEO_DURATION_KEY = 76647426  # presence indicates a video (value: [duration_ms])
 _LIVEPHOTO_KEY = 146008172
 _LOCATION_HEADER_BYTES = 256 * 1024
 
@@ -346,10 +346,7 @@ def _extract_first_page_items(
     items: list[MediaItem] = []
     seen: set[str] = set()
     for raw in best:
-        if _is_video_item(raw):
-            _record_video_key(raw, video_keys)
-            continue
-        item = _parse_album_item(raw)
+        item = _parse_item(raw, video_keys)
         if item is None or item.url in seen:
             continue
         seen.add(item.url)
@@ -448,10 +445,7 @@ def _parse_batchexecute_album_page(
 
     items: list[MediaItem] = []
     for raw in raw_items:
-        if _is_video_item(raw):
-            _record_video_key(raw, video_keys)
-            continue
-        item = _parse_album_item(raw)
+        item = _parse_item(raw, video_keys)
         if item is not None:
             items.append(item)
     return items, next_page
@@ -473,29 +467,72 @@ def _media_key(raw: Any) -> str | None:
     return None
 
 
+def _parse_item(raw: Any, video_keys: set[str] | None) -> MediaItem | None:
+    """Parse one album item; videos become playable video items.
+
+    A video's ``url`` stays its poster still and ``video_url`` is Google's
+    720p H.264 stream (``=m22``), which the video proxy streams to the card. Live photos
+    are still skipped (see #26). Every video's media key is recorded either
+    way, since publicalbum.org can't tell a video from a photo.
+    """
+    if not _is_video_item(raw):
+        return _parse_album_item(raw)
+    _record_video_key(raw, video_keys)
+    if _contains_key(raw, 0, _LIVEPHOTO_KEY):
+        return None
+    item = _parse_album_item(raw)
+    if item is None:
+        return None
+    item.video_url = f"{_SIZE_SUFFIX_RE.sub('', raw[1][0])}=m22"
+    item.duration_ms = _video_duration_ms(raw)
+    return item
+
+
 def _is_video_item(raw: Any) -> bool:
     """Return ``True`` when an album item carries a video duration.
 
     Google tags videos with key ``76647426`` (duration in ms) inside a metadata
     dict. That dict is usually the item's last element, but its position moves
     between responses, so scan every nested container instead of just ``[-1]``.
-    Live photos carry a duration too and are skipped along with videos, which
-    is what the photo-only slideshow wants (see #26).
+    Live photos carry a duration too, plus key ``146008172``.
     """
     return _contains_key(raw, 0)
 
 
-def _contains_key(node: Any, depth: int) -> bool:
+def _video_duration_ms(raw: Any) -> int | None:
+    """The clip length Google stores under the video key, e.g. ``[12345]``."""
+    value = _find_key(raw, 0, _VIDEO_DURATION_KEY)
+    if isinstance(value, list) and value:
+        value = value[0]
+    if type(value) is int and value > 0:
+        return value
+    return None
+
+
+_MISSING = object()
+
+
+def _contains_key(node: Any, depth: int, wanted: int = _VIDEO_DURATION_KEY) -> bool:
+    return _find_key(node, depth, wanted) is not _MISSING
+
+
+def _find_key(node: Any, depth: int, wanted: int) -> Any:
     if depth > 6:
-        return False
+        return _MISSING
     if isinstance(node, dict):
-        for key in node:
-            if key == _VIDEO_DURATION_KEY or key == str(_VIDEO_DURATION_KEY):
-                return True
-        return any(_contains_key(v, depth + 1) for v in node.values())
-    if isinstance(node, list):
-        return any(_contains_key(v, depth + 1) for v in node)
-    return False
+        for key, value in node.items():
+            if key == wanted or key == str(wanted):
+                return value
+        children = node.values()
+    elif isinstance(node, list):
+        children = node
+    else:
+        return _MISSING
+    for child in children:
+        found = _find_key(child, depth + 1, wanted)
+        if found is not _MISSING:
+            return found
+    return _MISSING
 
 
 def _parse_album_item(raw: Any) -> MediaItem | None:

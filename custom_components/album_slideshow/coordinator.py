@@ -3452,7 +3452,9 @@ class AlbumCoordinator(DataUpdateCoordinator):
         # Run publicalbum.org in parallel-ish: only call it if scrape was thin.
         # Threshold: if scrape returns >= 250 items we trust it; otherwise we
         # also call publicalbum.org and use whichever returns more.
-        if len(scraped_items) >= 250:
+        # publicalbum.org can't serve videos, so an album with any keeps the
+        # scraper's list.
+        if len(scraped_items) >= 250 or any(item.is_video for item in scraped_items):
             _LOGGER.info(
                 "Album scraper: source=batchexecute items=%d",
                 len(scraped_items),
