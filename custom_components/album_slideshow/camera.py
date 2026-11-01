@@ -141,6 +141,7 @@ class _NavigationCursor:
     recent_urls: tuple[str, ...]
     rng_state: Any
     paired_urls: tuple[str, ...] = ()
+    cycle_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -329,6 +330,9 @@ class AlbumSlideshowCamera(Camera):
         self._index = 0
         self._random_order: list[int] = []
         self._random_pos = 0
+        # Photos shown so far in the current random cycle, by URL, so the
+        # cycle survives the album changing size underneath it.
+        self._cycle_urls: list[str] = []
 
         self._download_cache = _DownloadCache(
             max_bytes=store.image_cache_mb * 1024 * 1024
@@ -801,6 +805,7 @@ class AlbumSlideshowCamera(Camera):
         self._invalidate_timeline()
         self._random_order = []
         self._random_pos = 0
+        self._cycle_urls = []
         self._recent_urls = []
         self._paired_urls = ()
         items = self._effective_items()
@@ -945,6 +950,7 @@ class AlbumSlideshowCamera(Camera):
             recent_urls=tuple(source._recent_urls),
             rng_state=source._rng.getstate(),
             paired_urls=source._paired_urls,
+            cycle_urls=tuple(getattr(source, "_cycle_urls", ())),
         )
 
     def _make_renderer(self, cursor: _NavigationCursor):
@@ -964,6 +970,7 @@ class AlbumSlideshowCamera(Camera):
         renderer._index = cursor.index
         renderer._random_order = list(cursor.random_order)
         renderer._random_pos = cursor.random_pos
+        renderer._cycle_urls = list(cursor.cycle_urls)
         renderer._recent_urls = list(cursor.recent_urls)
         renderer._paired_urls = cursor.paired_urls
         renderer._rng = random.Random()
@@ -1046,6 +1053,7 @@ class AlbumSlideshowCamera(Camera):
         self._index = frame.cursor.index
         self._random_order = list(frame.cursor.random_order)
         self._random_pos = frame.cursor.random_pos
+        self._cycle_urls = list(frame.cursor.cycle_urls)
         self._recent_urls = list(frame.cursor.recent_urls)
         self._paired_urls = frame.cursor.paired_urls
         self._rng.setstate(frame.cursor.rng_state)
@@ -1571,7 +1579,7 @@ class AlbumSlideshowCamera(Camera):
             return
 
         bias = getattr(self.store, "shuffle_age_bias", DEFAULT_SHUFFLE_AGE_BIAS)
-        self._index = self._next_age_weighted_index(items, bias) if bias else self._next_random_index(count)
+        self._index = self._next_age_weighted_index(items, bias) if bias else self._next_random_index(count, items)
         self._remember_recent(items[self._index].url, count)
 
     def _remember_recent(self, url: str, count: int) -> None:
@@ -1616,6 +1624,7 @@ class AlbumSlideshowCamera(Camera):
                 pos = self._random_pos
                 order[pos], order[position] = order[position], order[pos]
                 self._random_pos += 1
+                self._cycle_urls = [*getattr(self, "_cycle_urls", ()), url]
         self._remember_recent(url, count)
 
     def _peek_advance(self, count: int, items: list) -> None:
@@ -1981,7 +1990,7 @@ class AlbumSlideshowCamera(Camera):
         )
         count = len(items)
         if count <= 1 or min(weights) == max(weights):
-            return self._next_random_index(count)
+            return self._next_random_index(count, items)
         cooldown = min(5, max(1, count // 10))
         recent = set(self._recent_urls[-cooldown:])
         candidates = [
@@ -1992,24 +2001,65 @@ class AlbumSlideshowCamera(Camera):
             candidates = [index for index in range(count) if index != self._index]
         return self._rng.choices(candidates, weights=[weights[index] for index in candidates], k=1)[0]
 
-    def _next_random_index(self, count: int) -> int:
+    def _next_random_index(self, count: int, items: list[MediaItem] | None = None) -> int:
         if count <= 1:
             self._random_order = [0]
             self._random_pos = 0
+            self._cycle_urls = []
             return 0
 
         needs_new_cycle = len(self._random_order) != count or self._random_pos >= len(self._random_order)
         if needs_new_cycle:
-            self._random_order = list(range(count))
-            self._rng.shuffle(self._random_order)
-            self._random_pos = 0
-
-            if self._random_order and self._random_order[0] == self._index:
-                self._random_order.append(self._random_order.pop(0))
+            self._new_random_cycle(count, items)
 
         idx = self._random_order[self._random_pos]
         self._random_pos += 1
+        if items is not None:
+            self._cycle_urls = [*getattr(self, "_cycle_urls", ()), items[idx].url]
         return idx
+
+    def _new_random_cycle(self, count: int, items: list[MediaItem] | None) -> None:
+        """Shuffle a new cycle, or reshape the current one after the album changed.
+
+        Every photo is shown once per cycle. When the album gains or loses
+        photos mid-cycle, the photos already shown stay shown and only the
+        rest (new ones included) are shuffled. A fresh cycle puts the last half
+        of the previous one at its end, so a photo never comes straight back
+        across the cycle boundary.
+        """
+        order = list(range(count))
+        self._rng.shuffle(order)
+        shown = list(getattr(self, "_cycle_urls", ()))
+        if items is None:
+            if order[0] == self._index:
+                order.append(order.pop(0))
+            self._random_order, self._random_pos, self._cycle_urls = order, 0, []
+            return
+
+        urls = [item.url for item in items]
+        shown_set = set(shown)
+        done = [index for index in order if urls[index] in shown_set]
+        if len(done) < count and self._random_pos < len(self._random_order):
+            # Mid-cycle album change: carry on with the photos not shown yet.
+            self._random_order = done + [index for index in order if urls[index] not in shown_set]
+            self._random_pos = len(done)
+            present = set(urls)
+            self._cycle_urls = [url for url in shown if url in present]
+            return
+
+        last = shown or list(getattr(self, "_recent_urls", ()))
+        if not last and 0 <= self._index < count:
+            last = [urls[self._index]]
+        # Holding back the last half evens out the gap: any photo waits at
+        # least half the album before it can come up again.
+        keep = max(1, count // 2)
+        recent = set(last[-keep:])
+        self._random_order = (
+            [index for index in order if urls[index] not in recent]
+            + [index for index in order if urls[index] in recent]
+        )
+        self._random_pos = 0
+        self._cycle_urls = []
 
     async def _fetch_bytes(self, url: str) -> bytes | None:
         key = self._download_key(url)
